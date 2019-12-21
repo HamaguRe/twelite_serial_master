@@ -1,7 +1,7 @@
 // TWELITEの親機にシリアルでデータを送って無線で子機に転送
 // 
 // TWELITEのファームウェアは公式配布の「シリアル通信アプリ」
-// 書式モード，バイナリー形式
+// 書式モード・バイナリー形式（AI2ピンLo）
 // 115200bps，8bit parity none, ストップビット1
 
 use std::io;
@@ -14,6 +14,7 @@ use serial;
 use serial::prelude::*;
 
 const SLAVE_ID: u8 = 0x78;  // ブロードキャストアドレス
+const RESPONSE_ID: u8 = 0x13;  // 応答ID（任意に指定可能）
 
 fn main() {
     let mut port = serial::open("/dev/ttyUSB1").expect("Couldn't open serial port.");
@@ -21,43 +22,64 @@ fn main() {
 
     thread::sleep(Duration::from_millis(1000));  // 少し待ってあげないとコケる
 
-    // 送信データ（拡張形式）
-    // 子機から親機に ACK 付きで 123456 を送信する
-    let mut data = vec![SLAVE_ID, 0xA0, 0x13, 0x01, 0xFF, 0x12, 0x34, 0x56];
-    //let mut data = vec![0x12, 0x34, 0x56];
-    let tx = make_packet(&mut data).unwrap();
 
+    // 送信データ
+    let mut data = vec![0x12, 0x34, 0x56];
+    let tx = make_packet(&mut data).unwrap();
 
     let mut rx_buf: Vec<u8> = vec![0; 30];
     loop {
         port.write(&tx[..]).unwrap();
         let byte_num = port.read(&mut rx_buf[..]).unwrap();
 
-        for i in 0..30 {
-            print!("{:X}, ", rx_buf[i]);
+        let values = match parser(&rx_buf) {
+            Ok(val) => val,
+            Err(err) => {
+                println!("parser: {}", err);
+                (0, 0, 0, 0, 0, vec![0])  // 適当な値を返しておく
+            },
+        };
+
+        // パーサで取り出したデータをHexで表示
+        print!("[");
+        for i in 0..(values.5).len() {
+            print!("0x{:X}, ", (values.5)[i]);
         }
-        print!("\n");
+        print!("]\n");
+
+        // 受信データ表示（デバッグ用）
+        //for i in 0..30 {
+        //    print!("0x{:X}, ", rx_buf[i]);
+        //}
+        //print!("\n");
 
         thread::sleep(Duration::from_millis(800));
     }
 }
 
-// データ部を入力して，TWELITEに入力するためのデータ構造を作る．
+// 任意データ部を入力して，TWELITEに入力するためのデータ構造を作る．
 // TWELITEの最大送信バイト数は640Byteだが，パケットが大きすぎると送信段階で
 // 複数に分かれてしまうため80Byte以下にすることが推奨されている．
+// この実装で扱える任意データの最大サイズは，オプション列を考慮して620Byte
 fn make_packet(data: &mut Vec<u8>) -> Result<Vec<u8>, &'static str> {
-    if data.len() > 640 {
-        return Err("Data size exceeds 640Byte.");
+    if data.len() > 620 {
+        return Err("Data size exceeds 620Byte.");
     }
 
     let mut packet: Vec<u8> = vec![0xA5, 0x5A];  // ヘッダ
     // データ長を付加
-    let length = data.len() as u16;
+    let data_len = data.len() as u16;
+    let tmp_h = (data_len >> 8) as u8;
+    let tmp_l = (data_len & 0xFF) as u8;
+    packet.push(0x80 | tmp_h);
+    packet.push(tmp_l);
 
+    // ----- データ部を作る（拡張形式の送信コマンド）----- //
+    packet.push(SLAVE_ID);
+    packet.push(0xA0);  // 固定値
+    packet.push(RESPONSE_ID);
+    packet.append(&mut vec![0x01, 0xFF]);  // オプション列（0x01はMAC ACKの設定）
 
-    let length = data.len() as u8;
-    packet.push(0x80);
-    packet.push(length);
     // データを入れて最後にチェックサムを付加
     let checksum = calc_checksum(data);
     packet.append(data);
@@ -77,28 +99,36 @@ fn calc_checksum(data: &Vec<u8>) -> u8 {
 /// 受信バッファの値から任意データ部その他諸々の値を取り出す
 /// 返り値：(送信元ID: u8, 応答ID: u8, 送信元拡張アドレス: u32, 
 ///          送信先（受信側）拡張アドレス: u32, LQI値: u8, 任意データ: Vec<u8>)
-fn parser(rx: Vec<u8>) -> Result<(u8, u8, u32, u32, u8, Vec<u8>), &'static str> {
+fn parser(rx: &Vec<u8>) -> Result<(u8, u8, u32, u32, u8, Vec<u8>), &'static str> {
     let mut optinal_data: Vec<u8> = Vec::new();
-
+    let mut header_flag = false;
     let mut i: usize = 0;
+
     // ヘッダを探す
     for _ in 0..(rx.len() - 1) {
         if rx[i] == 0xA5 {
             i += 1;
             if rx[i] == 0x5A {
+                header_flag = true;
                 break;
-            } else {
-                return Err("Header does not exist.");
             }
         }
         i += 1;
     }
 
+    // ヘッダを読み出せずに最後まで行ってしまった場合の処理
+    if header_flag == false {
+        return Err("Header does not exist.");
+    }
+
     // データ長を読む
+    i += 1;
     let data_len: usize;
-    if rx[i] == 0x80 {
+    if (rx[i] & 0x80) == 0x80 {
+        let tmp_h = ((rx[i] & 0x7F) as usize) << 8;
         i += 1;
-        data_len = rx[i] as usize;
+        let tmp_l = rx[i] as usize;
+        data_len = tmp_h | tmp_l;
     } else {
         return Err("Syntax error (The 3rd byte MSB is not 1).");
     }
@@ -111,7 +141,7 @@ fn parser(rx: Vec<u8>) -> Result<(u8, u8, u32, u32, u8, Vec<u8>), &'static str> 
     // 送信元ID
     i += 1;
     let sender_id = rx[i];
-    let mut checksum = sender_id.clone();  // ここから全てのByteのXORをとっていく．
+    let mut checksum = rx[i];  // ここからデータ部の全てのByteのXORをとっていく．
     // 固定値を見て構文の整合性を確認
     i += 1;
     if rx[i] != 0xA0 {
@@ -152,23 +182,24 @@ fn parser(rx: Vec<u8>) -> Result<(u8, u8, u32, u32, u8, Vec<u8>), &'static str> 
     checksum ^= rx[i];
     i += 1;
     optional_data_len |= rx[i] as usize;
+    checksum ^= rx[i];
 
     // データ長が残りのバッファサイズを超えていた場合の処理
-    if optional_data_len >= rx.len() {
+    if optional_data_len >= (rx.len() - (i + 1)) {
         return Err("Optional data does not fit in Rx buffer.");
     }
 
     // 任意データ
+    i += 1;
     let mut num = 0;
     for j in i..(i + optional_data_len) {
         checksum ^= rx[j];
-        optinal_data.push(rx[j]);
+        optinal_data.push( rx[j] );
         num += 1;
     }
-    i += num - 1;
+    i += num;
 
     // チェックサムで整合性を確認
-    i += 1;
     if rx[i] != checksum {
         return Err("Checksum mismatch.");
     }
