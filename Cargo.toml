@@ -1,0 +1,8 @@
+[package]
+name = "twelite_serial_master"
+version = "0.1.0"
+authors = ["HamaguRe <space-denpa.jp>"]
+edition = "2018"
+
+[dependencies]
+serial = "0.4"
