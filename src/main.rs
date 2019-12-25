@@ -30,7 +30,7 @@ fn main() {
     let mut rx_buf: Vec<u8> = vec![0; 30];
     loop {
         port.write(&tx[..]).unwrap();
-        let byte_num = port.read(&mut rx_buf[..]).unwrap();
+        let _byte_num = port.read(&mut rx_buf[..]).unwrap();
 
         let values = match parser(&rx_buf) {
             Ok(val) => val,
@@ -75,9 +75,7 @@ fn make_packet(data: &mut Vec<u8>) -> Result<Vec<u8>, &'static str> {
     packet.push(tmp_l);
 
     // ----- データ部を作る（拡張形式の送信コマンド）----- //
-    packet.push(SLAVE_ID);
-    packet.push(0xA0);  // 固定値
-    packet.push(RESPONSE_ID);
+    packet.append(&mut vec![SLAVE_ID, 0xA0, RESPONSE_ID]);
     packet.append(&mut vec![0x01, 0xFF]);  // オプション列（0x01はMAC ACKの設定）
 
     // データを入れて最後にチェックサムを付加
@@ -105,7 +103,7 @@ fn parser(rx: &Vec<u8>) -> Result<(u8, u8, u32, u32, u8, Vec<u8>), &'static str>
     let mut i: usize = 0;
 
     // ヘッダを探す
-    for _ in 0..(rx.len() - 1) {
+    for _ in 0..(rx.len() - 3) {  // 3引いておかないとデータ長を読むときにオーバーランする
         if rx[i] == 0xA5 {
             i += 1;
             if rx[i] == 0x5A {
@@ -134,7 +132,7 @@ fn parser(rx: &Vec<u8>) -> Result<(u8, u8, u32, u32, u8, Vec<u8>), &'static str>
     }
 
     // データ長が残りのバッファサイズを超えていた場合の処理
-    if data_len >= (rx.len() - i) {
+    if data_len >= (rx.len() - (i + 2)) {
         return Err("Data length exceeds packet size.");
     }
 
@@ -145,7 +143,7 @@ fn parser(rx: &Vec<u8>) -> Result<(u8, u8, u32, u32, u8, Vec<u8>), &'static str>
     // 固定値を見て構文の整合性を確認
     i += 1;
     if rx[i] != 0xA0 {
-        return Err("Syntax error(The sixth of the packet is not 0xA0).");
+        return Err("Syntax error (The sixth of the packet is not 0xA0).");
     }
     checksum ^= 0xA0;
 
@@ -160,7 +158,7 @@ fn parser(rx: &Vec<u8>) -> Result<(u8, u8, u32, u32, u8, Vec<u8>), &'static str>
         sender_extend_addr |= (rx[i] as u32) << ( (3 - j) * 8 );
         checksum ^= rx[i];
     }
-    // 送信先拡張アドレス（自分のアドレスのこと）
+    // 送信先拡張アドレス（自分の拡張アドレスのこと）
     // 未設定の場合は0xFFが4Byte入っている
     let mut self_extend_addr: u32 = 0;
     for j in 0..4 {
@@ -169,35 +167,32 @@ fn parser(rx: &Vec<u8>) -> Result<(u8, u8, u32, u32, u8, Vec<u8>), &'static str>
         checksum ^= rx[i];
     }
 
-    // 通信品質LQI値
+    // LQI(電解強度)値
     i += 1;
     let lqi = rx[i];
     checksum ^= rx[i];
 
     // 続く任意データ領域のByte数
-    // u16で十分だけど，for式で使う都合上usizeにする
     let mut optional_data_len: usize = 0;
     i += 1;
+    checksum ^= rx[i];
     optional_data_len |= (rx[i] as usize) << 8;
-    checksum ^= rx[i];
     i += 1;
-    optional_data_len |= rx[i] as usize;
     checksum ^= rx[i];
+    optional_data_len |= rx[i] as usize;
 
-    // データ長が残りのバッファサイズを超えていた場合の処理
-    if optional_data_len >= (rx.len() - (i + 1)) {
+    // 任意データ領域が残りのバッファサイズを超えていた場合の処理
+    if optional_data_len >= (rx.len() - (i + 2)) {
         return Err("Optional data does not fit in Rx buffer.");
     }
 
     // 任意データ
     i += 1;
-    let mut num = 0;
     for j in i..(i + optional_data_len) {
         checksum ^= rx[j];
         optinal_data.push( rx[j] );
-        num += 1;
     }
-    i += num;
+    i += optional_data_len;
 
     // チェックサムで整合性を確認
     if rx[i] != checksum {
@@ -232,4 +227,28 @@ fn port_config(port: &mut SerialPort) -> io::Result<()> {
     })?;
     port.set_timeout(Duration::from_millis(5000))?;
     Ok(())
+}
+
+
+#[test]
+fn test_parser() {
+    // データ部（拡張形式）
+    let mut data: Vec<u8> = vec![0x00, 0xA0, 0x13, 
+                             0x1A, 0x1B, 0x1C, 0x1D, 
+                             0x2A, 0x2B, 0x2C, 0x2D, 
+                             0xFF, 0x00, 0x03, 0x12, 
+                             0x34, 0x56];
+    let checksum = calc_checksum(&data);
+    let mut rx_buf = vec![0xA5, 0x5A, 0x80, 0x11];
+    rx_buf.append(&mut data);
+    rx_buf.push(checksum);
+    rx_buf.push(0x04);
+    
+    let vals = parser(&rx_buf).unwrap();
+    assert_eq!(vals.0, 0x00);  // 送信元ID
+    assert_eq!(vals.1, 0x13);  // 応答ID
+    assert_eq!(vals.2, 0x1A1B1C1D);  // 送信元拡張アドレス
+    assert_eq!(vals.3, 0x2A2B2C2D);  // 送信先拡張アドレス
+    assert_eq!(vals.4, 0xFF);  // LQI値
+    assert_eq!(vals.5, vec![0x12, 0x34, 0x56]);  // 任意データ
 }
